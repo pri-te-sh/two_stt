@@ -1,0 +1,22 @@
+# Core framework
+fastapi==0.114.*
+uvicorn[standard]==0.30.*
+websockets==12.*
+pydantic==2.*
+python-dotenv==1.*
+
+# Audio processing
+numpy==2.*
+soundfile==0.12.*
+webrtcvad==2.0.*
+
+# ASR
+faster-whisper==1.*
+ctranslate2==4.*
+
+# Observability
+prometheus-client==0.20.*
+pynvml==11.*
+
+# Utilities
+orjson==3.*
