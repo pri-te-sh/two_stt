@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+websockets
+orjson
+pydantic
+prometheus-client
+numpy
+soundfile
+webrtcvad
+ctranslate2
+faster-whisper
