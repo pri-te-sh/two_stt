@@ -60,7 +60,7 @@ def make_app() -> FastAPI:
         last_emit = 0.0
         interim_task: asyncio.Task | None = None
 
-        async def run_interim()
+        async def run_interim():
 :
             audio = load_audio_from_bytes(b"".join(bufs))
             # Optional: trim interims to the last N seconds to keep them snappy
