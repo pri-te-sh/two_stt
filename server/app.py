@@ -141,7 +141,7 @@ async def ws_endpoint(ws: WebSocket):
                     await scheduler.submit(audio=session.ring.to_numpy(), lang=session.lang,
                                            kind="final", cb=lambda t,k: asyncio.create_task(on_decode_done(t,k)))
                     # After scheduling final, clear ring for next utterance
-                    session.ring = RingBuffer(settings.MAX_RING_SECONDS, settings.SAMPLE_RATE)
+                    session.ring = RingBuffer(settings.MAX_RING_SECONDS, session.ring.sample_rate)
 
             elif op == "stop":
                 if session is None:

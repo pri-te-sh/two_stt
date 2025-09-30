@@ -1,28 +1,28 @@
 from __future__ import annotations
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel
+from typing import Optional, Literal
 
 class StartMsg(BaseModel):
-    op: str = Field("start", const=True)
+    op: Literal["start"] = "start"
     sample_rate: int = 16000
     lang: str = "auto"
 
 class AudioMsg(BaseModel):
-    op: str = Field("audio", const=True)
+    op: Literal["audio"] = "audio"
     payload: str  # base64 PCM16 little-endian mono
 
 class StopMsg(BaseModel):
-    op: str = Field("stop", const=True)
+    op: Literal["stop"] = "stop"
 
 class InterimOut(BaseModel):
-    type: str = Field("interim", const=True)
+    type: Literal["interim"] = "interim"
     text: str
     stable_chars: int
 
 class FinalOut(BaseModel):
-    type: str = Field("final", const=True)
+    type: Literal["final"] = "final"
     text: str
 
 class StatusOut(BaseModel):
-    type: str = Field("status", const=True)
+    type: Literal["status"] = "status"
     message: str
