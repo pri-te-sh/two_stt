@@ -14,8 +14,8 @@ class Config(BaseModel):
     env: str = Field(default="dev")
     
     # Server
-    bind_host: str = Field(default="127.0.0.1")
-    bind_port: int = Field(default=8081)
+    bind_host: str = Field(default="0.0.0.0")
+    bind_port: int = Field(default=8080)
     
     # Models
     interim_model: str = Field(default="small")
