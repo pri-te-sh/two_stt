@@ -1,152 +1,159 @@
-"""Main FastAPI application."""
-import uvicorn
-from fastapi import FastAPI, WebSocket
+from __future__ import annotations
+import base64
+import asyncio
+import time
+from typing import Optional
+
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-from starlette.responses import Response
-from contextlib import asynccontextmanager
 
-from server.routes import websocket_endpoint
-from runtime.state import get_runtime
-from util.logging import setup_logging, get_logger
-from util.config import config
-import metrics.prometheus as metrics
-
-# Setup logging first
-setup_logging()
-logger = get_logger(__name__)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan manager for startup and shutdown."""
-    # Startup
-    logger.info("Starting STT server...")
-    logger.info(f"Environment: {config.env}")
-    logger.info(f"Bind: {config.bind_host}:{config.bind_port}")
-    logger.info(f"Models: interim={config.interim_model}, final={config.final_model}")
-    
-    # Initialize runtime
-    runtime = get_runtime()
-    await runtime.startup()
-    
-    logger.info("STT server started successfully")
-    
-    # Set system info metrics
-    metrics.system_info.info({
-        "interim_model": config.interim_model,
-        "final_model": config.final_model,
-        "sample_rate": str(config.sample_rate),
-    })
-    
-    yield
-    
-    # Shutdown
-    logger.info("Shutting down STT server...")
-    await runtime.shutdown()
-    logger.info("STT server shut down")
-
-
-# Create FastAPI app
-app = FastAPI(
-    title="Real-time STT Server",
-    description="Dual-model speech-to-text server with interim and final transcriptions",
-    version="1.0.0",
-    lifespan=lifespan
+from server.config import settings
+from server.audio.vad import RingBuffer, VadGate
+from server.asr.scheduler import Scheduler
+from server.common.messages import (
+    StartMsg, AudioMsg, StopMsg, InterimOut, FinalOut, StatusOut
 )
 
+app = FastAPI(title="MVP STT Server")
+scheduler = Scheduler()
 
-@app.get("/health")
-async def health():
-    """Basic health check (process is alive)."""
-    return {"status": "ok"}
+@app.on_event("startup")
+async def _startup():
+    await scheduler.start()
 
+@app.on_event("shutdown")
+async def _shutdown():
+    await scheduler.stop()
 
 @app.get("/ready")
 async def ready():
-    """Readiness check (models loaded and workers running)."""
-    runtime = get_runtime()
-    
-    is_ready = (
-        runtime.models is not None and
-        runtime.worker_final is not None and
-        runtime.worker_interim is not None and
-        runtime.worker_final.running and
-        runtime.worker_interim.running
-    )
-    
-    if is_ready:
-        return {"status": "ready"}
-    else:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "not_ready"}
-        )
-
+    # Touch the model once to load lazily
+    from server.asr.engine import get_model
+    get_model()
+    return JSONResponse({"status":"ok"})
 
 @app.get("/status")
 async def status():
-    """Detailed status including queue depths and configuration."""
-    runtime = get_runtime()
-    
-    queue_depths = runtime.scheduler.get_queue_depths()
-    scheduler_stats = runtime.scheduler.get_stats()
-    bp_state = runtime.backpressure.get_state()
-    
-    worker_stats = {}
-    if runtime.worker_final:
-        worker_stats["final"] = runtime.worker_final.get_stats()
-    if runtime.worker_interim:
-        worker_stats["interim"] = runtime.worker_interim.get_stats()
-    
-    return {
-        "status": "running",
-        "config": {
-            "interim_model": config.interim_model,
-            "final_model": config.final_model,
-            "sample_rate": config.sample_rate,
-            "base_cooldown_ms": config.interim_cooldown_ms,
-            "base_tail_seconds": config.tail_seconds,
-        },
-        "queues": queue_depths,
-        "scheduler_stats": scheduler_stats,
-        "backpressure": bp_state,
-        "workers": worker_stats,
-        "connections": {
-            "active": len(runtime.connections),
-        }
-    }
+    return JSONResponse({
+        "status": "ok",
+        "model": settings.MODEL_NAME,
+        "device": settings.DEVICE,
+        "compute_type": settings.COMPUTE_TYPE,
+    })
 
+class Session:
+    def __init__(self, ws: WebSocket, sample_rate: int, lang: str):
+        self.ws = ws
+        self.lang = lang
+        self.ring = RingBuffer(settings.MAX_RING_SECONDS, sample_rate)
+        self.vad = VadGate(sample_rate, settings.VAD_FRAME_MS, settings.VAD_AGGRESSIVENESS,
+                           settings.FINAL_SILENCE_MS_MIN, settings.FINAL_SILENCE_MS_MAX)
+        self.last_interim_emit_ms = 0.0
+        self.prev_interim_text = ""
+        self.interim_inflight = False
 
-@app.get("/metrics")
-async def metrics_endpoint():
-    """Prometheus metrics endpoint."""
-    if not config.enable_metrics:
-        return Response(status_code=404)
-    
-    return Response(
-        content=generate_latest(),
-        media_type=CONTENT_TYPE_LATEST
-    )
+    async def maybe_emit_interim(self, text: str):
+        now = time.monotonic() * 1000
+        if not text:
+            return
+        # Gate: first, delta length >=6, or >= INTERIM_MIN_MS since last emit
+        cond = (not self.prev_interim_text) or \
+               (abs(len(text) - len(self.prev_interim_text)) >= 6) or \
+               (now - self.last_interim_emit_ms >= settings.INTERIM_MIN_MS)
+        if not cond:
+            return
+        # Stabilization: common prefix length
+        stable = 0
+        for a, b in zip(text, self.prev_interim_text):
+            if a == b:
+                stable += 1
+            else:
+                break
+        await self.ws.send_json(InterimOut(text=text, stable_chars=stable).model_dump())
+        self.prev_interim_text = text
+        self.last_interim_emit_ms = now
 
+    async def emit_final(self, text: str):
+        if text:
+            await self.ws.send_json(FinalOut(text=text).model_dump())
+        # reset interim state after a final
+        self.prev_interim_text = ""
+        self.last_interim_emit_ms = 0.0
+        self.interim_inflight = False
 
 @app.websocket("/ws")
-async def websocket_route(websocket: WebSocket):
-    """WebSocket endpoint for audio streaming."""
-    await websocket_endpoint(websocket)
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    await ws.send_json(StatusOut(message="connection open").model_dump())
 
+    session: Optional[Session] = None
 
-def main():
-    """Main entry point."""
-    uvicorn.run(
-        "server.app:app",
-        host=config.bind_host,
-        port=config.bind_port,
-        loop="uvloop",
-        log_config=None,  # We handle logging ourselves
-        access_log=False
-    )
+    async def on_decode_done(text: str, kind: str):
+        # Called from scheduler worker thread via event loop
+        if kind == "interim":
+            session.interim_inflight = False
+            await session.maybe_emit_interim(text)
+        else:
+            await session.emit_final(text)
 
+    try:
+        while True:
+            raw = await ws.receive_text()
+            # Parse by op
+            try:
+                if raw.strip().startswith("{"):
+                    import json
+                    obj = json.loads(raw)
+                    op = obj.get("op")
+                else:
+                    await ws.send_json(StatusOut(message="invalid message").model_dump())
+                    continue
+            except Exception:
+                await ws.send_json(StatusOut(message="json parse error").model_dump())
+                continue
 
-if __name__ == "__main__":
-    main()
+            if op == "start":
+                msg = StartMsg(**obj)
+                if session is None:
+                    session = Session(ws, msg.sample_rate, msg.lang)
+                    await ws.send_json(StatusOut(message="stream started").model_dump())
+                else:
+                    await ws.send_json(StatusOut(message="already started").model_dump())
+
+            elif op == "audio":
+                if session is None:
+                    await ws.send_json(StatusOut(message="send start first").model_dump())
+                    continue
+                msg = AudioMsg(**obj)
+                pcm = base64.b64decode(msg.payload)
+                finalize = session.vad.update_and_check_finalize(pcm)
+                session.ring.extend_pcm16(pcm)
+
+                # Opportunistic interim (coalesced: only if no in-flight)
+                if not session.interim_inflight:
+                    session.interim_inflight = True
+                    await scheduler.submit(audio=session.ring.to_numpy(), lang=session.lang,
+                                           kind="interim", cb=lambda t,k: asyncio.create_task(on_decode_done(t,k)))
+
+                if finalize:
+                    # Final job on the buffered audio
+                    await scheduler.submit(audio=session.ring.to_numpy(), lang=session.lang,
+                                           kind="final", cb=lambda t,k: asyncio.create_task(on_decode_done(t,k)))
+                    # After scheduling final, clear ring for next utterance
+                    session.ring = RingBuffer(settings.MAX_RING_SECONDS, settings.SAMPLE_RATE)
+
+            elif op == "stop":
+                if session is None:
+                    await ws.send_json(StatusOut(message="not started").model_dump())
+                    continue
+                # Force a final on remaining audio
+                await scheduler.submit(audio=session.ring.to_numpy(), lang=session.lang,
+                                       kind="final", cb=lambda t,k: asyncio.create_task(on_decode_done(t,k)))
+                await ws.send_json(StatusOut(message="stream stopped").model_dump())
+
+            else:
+                await ws.send_json(StatusOut(message=f"unknown op: {op}").model_dump())
+
+    except WebSocketDisconnect:
+        return

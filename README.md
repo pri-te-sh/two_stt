@@ -1,330 +1,82 @@
-# Real-time Speech-to-Text Server
+README.md
 
-Production-grade dual-model STT server with interim (fast) and final (quality) transcriptions.
+# MVP FastAPI STT Server (priority scheduler)
 
-## Architecture
+This MVP shows:
+- WebSocket audio streaming
+- CPU WebRTC-VAD gating with adaptive finalization
+- Priority scheduling (final > interim) with interim coalescing (max 1 in-flight per session)
+- Faster-Whisper decoding tuned differently for interim vs final
+- Stabilized interim payloads with `stable_chars`
 
-- **Single process, shared models**: One Uvicorn worker keeps both models in VRAM
-- **Dual-model system**: 
-  - Interim model (small/base): Fast, streaming results
-  - Final model (distil-large-v3/large-v3): High-quality final transcriptions
-- **Priority scheduler**: Finals prioritized over interims with coalescing
-- **Backpressure management**: Dynamic throttling based on queue depths
-- **WebRTC VAD**: CPU-based voice activity detection
-- **Per-connection state**: Ring buffers, utterance tracking, language detection
+## Quick start
 
-## Requirements
+### 1) System deps
+- Python 3.10+
+- (Optional) NVIDIA GPU with CUDA 11.8+ for best performance
 
-- Python 3.11+
-- CUDA-capable GPU (tested on RTX 4090 with 24GB VRAM)
-- NVIDIA driver with CUDA 12.x
-- Ubuntu 24.04 or similar
-
-## Installation
-
-### 1. System Dependencies
-
+### 2) Create venv & install
 ```bash
-# Install system packages
-sudo apt-get update
-sudo apt-get install -y build-essential python3.11 python3.11-venv python3-pip \
-    ffmpeg libsndfile1 nginx
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
 
-# Verify NVIDIA driver and CUDA
-nvidia-smi
-```
+3) Run
 
-### 2. Setup User and Directories
+# Recommended defaults are set via env vars in run.sh
+bash run.sh
+# or
+UVICORN_WORKERS=1 uvicorn server.app:app --host 0.0.0.0 --port 8000 --log-level info --ws websockets
 
-```bash
-# Create user and directories (as root)
-sudo useradd -m -s /bin/bash stt
-sudo mkdir -p /opt/stt/{app,logs,models,venv}
-sudo chown -R stt:stt /opt/stt
-```
-
-### 3. Install Python Dependencies
+Env vars (defaults in server/config.py):
 
-```bash
-# Create virtual environment
-sudo -u stt python3.11 -m venv /opt/stt/venv
-sudo -u stt /opt/stt/venv/bin/pip install --upgrade pip wheel
+MODEL_NAME (default: base) – try small, medium, distil-large-v3, large-v3 if VRAM allows
 
-# Install dependencies
-sudo -u stt /opt/stt/venv/bin/pip install -r requirements.txt
-```
+DEVICE (default: auto)
 
-### 4. Configure Environment
+COMPUTE_TYPE (default: float16) – try int8_float16 for small GPUs or CPU fallback
 
-```bash
-# Copy code to /opt/stt/app
-sudo cp -r /home/claude/stt-server/* /opt/stt/app/
-sudo chown -R stt:stt /opt/stt/app
+INTERIM_MIN_MS (default: 350)
 
-# Create .env file
-sudo -u stt cp /opt/stt/app/.env.example /opt/stt/app/.env
+FINAL_SILENCE_MS_MIN (default: 400), FINAL_SILENCE_MS_MAX (default: 700)
 
-# Edit configuration as needed
-sudo -u stt nano /opt/stt/app/.env
-```
+4) Simple test (Python client)
 
-## Configuration
+python - <<'PY'
+import asyncio, websockets, json, base64, soundfile as sf
 
-Edit `.env` to customize:
-
-```bash
-# Models
-INTERIM_MODEL=small              # or base
-FINAL_MODEL=distil-large-v3      # or large-v3
-INTERIM_COMPUTE=int8_float16
-FINAL_COMPUTE=float16
-
-# Timing
-INTERIM_COOLDOWN_MS=220          # Interim rate limit
-TAIL_SECONDS=7                   # Tail window size
-SCHEDULER_TICK_MS=12             # Scheduler poll interval
-
-# Backpressure
-FINAL_HI=6                       # Final queue high watermark
-FINAL_CRIT=12                    # Final queue critical watermark
-INTERIM_HI=20                    # Interim queue high watermark
-INTERIM_CRIT=40                  # Interim queue critical watermark
-```
-
-## Warmup Models
+async def main():
+    uri = "ws://localhost:8000/ws"
+    async with websockets.connect(uri, max_size=2**23) as ws:
+        await ws.send(json.dumps({"op":"start","sample_rate":16000,"lang":"en"}))
+        # send a short wav file (mono 16k PCM16)
+        audio, sr = sf.read("sample.wav", dtype='int16')
+        assert sr==16000
+        chunk = 16000//2  # 0.5s
+        for i in range(0, len(audio), chunk):
+            buf = audio[i:i+chunk].tobytes()
+            await ws.send(json.dumps({"op":"audio","payload": base64.b64encode(buf).decode()}))
+            await asyncio.sleep(0.05)
+        await ws.send(json.dumps({"op":"stop"}))
+        try:
+            while True:
+                msg = await asyncio.wait_for(ws.recv(), timeout=3)
+                print(msg)
+        except asyncio.TimeoutError:
+            pass
 
-Before starting the server, warm up the models:
+asyncio.run(main())
+PY
 
-```bash
-sudo -u stt /opt/stt/venv/bin/python /opt/stt/app/scripts/warmup.py
-```
+5) Health endpoints
 
-## Running the Server
+GET /ready – model loaded
 
-### Development Mode
-
-```bash
-cd /opt/stt/app
-/opt/stt/venv/bin/python server/app.py
-```
+GET /status – simple JSON status
 
-### Production with Systemd
+Notes
 
-1. Create systemd service:
-
-```bash
-sudo nano /etc/systemd/system/stt.service
-```
-
-```ini
-[Unit]
-Description=Realtime STT server
-After=network-online.target
-
-[Service]
-User=stt
-Group=stt
-WorkingDirectory=/opt/stt/app
-EnvironmentFile=/opt/stt/app/.env
-ExecStart=/opt/stt/venv/bin/uvicorn server.app:app --host ${BIND_HOST} --port ${BIND_PORT} --loop uvloop --http httptools
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-```
-
-2. Enable and start:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now stt
-sudo systemctl status stt
-```
-
-3. View logs:
-
-```bash
-sudo journalctl -u stt -f
-```
-
-## Nginx Configuration (Optional)
-
-For TLS termination and WebSocket proxy:
-
-```nginx
-server {
-    listen 443 ssl http2;
-    server_name stt.yourdomain.com;
-
-    ssl_certificate /etc/letsencrypt/live/stt.yourdomain.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/stt.yourdomain.com/privkey.pem;
-
-    location /ws {
-        proxy_pass http://127.0.0.1:8081/ws;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        proxy_buffering off;
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:8081;
-        proxy_set_header Host $host;
-    }
-}
-
-server {
-    listen 80;
-    server_name stt.yourdomain.com;
-    return 301 https://$host$request_uri;
-}
-```
-
-## API Endpoints
-
-### WebSocket: `/ws`
-
-Binary protocol for audio streaming + JSON control messages.
-
-**Client → Server:**
-
-Audio frames (binary):
-- PCM16 mono @ 16 kHz
-- 20-60 ms chunks (640-1920 bytes)
-
-Control messages (JSON):
-```json
-{"event": "start", "language": "auto"}
-{"event": "stop"}
-{"event": "set", "interimRate": 4}
-```
-
-**Server → Client (JSON):**
-
-Interim result:
-```json
-{
-  "type": "interim",
-  "conn": "conn_...",
-  "text": "hello world",
-  "stable_chars": 7,
-  "t0": 1234567890.123,
-  "t1": 1234567892.456
-}
-```
-
-Final result:
-```json
-{
-  "type": "final",
-  "conn": "conn_...",
-  "text": "hello world",
-  "segments": [
-    {"start": 0.0, "end": 1.2, "text": "hello"},
-    {"start": 1.2, "end": 2.3, "text": "world"}
-  ],
-  "language": "en",
-  "t0": 1234567890.123,
-  "t1": 1234567892.456
-}
-```
-
-Status update:
-```json
-{
-  "type": "status",
-  "backpressure": "normal",
-  "cooldown_ms": 220,
-  "tail_s": 7.0,
-  "interim_paused": false
-}
-```
-
-### HTTP Endpoints
-
-- `GET /health` - Health check (process alive)
-- `GET /ready` - Readiness check (models loaded)
-- `GET /status` - Detailed status (queues, workers, config)
-- `GET /metrics` - Prometheus metrics
-
-## Metrics
-
-Prometheus metrics available at `/metrics`:
-
-- `stt_active_connections` - Active WebSocket connections
-- `stt_queue_depth{queue_type}` - Queue depths (final, interim)
-- `stt_jobs_processed_total{job_type, status}` - Jobs processed
-- `stt_decode_duration_seconds{job_type}` - Decode latencies
-- `stt_backpressure_level` - Current backpressure level
-- `stt_gpu_memory_used_bytes{gpu_id}` - GPU memory usage
-- And more...
-
-## Monitoring
-
-### Queue Depths
-
-```bash
-curl http://localhost:8081/status | jq '.queues'
-```
-
-### Worker Stats
-
-```bash
-curl http://localhost:8081/status | jq '.workers'
-```
-
-### Logs
-
-```bash
-# Systemd
-sudo journalctl -u stt -f
-
-# Or if running directly
-tail -f /opt/stt/logs/stt.log
-```
-
-## Troubleshooting
-
-### High Final Latency
-
-1. Check queue depths: `curl localhost:8081/status | jq '.queues'`
-2. Verify backpressure: `curl localhost:8081/status | jq '.backpressure'`
-3. Reduce final beam_size to 3 in `asr/models.py`
-
-### GPU OOM
-
-1. Check GPU memory: `nvidia-smi`
-2. Reduce tail_seconds in `.env`
-3. Use smaller models (base for interim, distil-large-v3 for final)
-
-### Repeating Interims
-
-1. Verify `condition_on_previous_text=False` for interims in `asr/models.py`
-2. Check stabilization rules in `server/routes.py`
-
-### cuDNN/Torch Errors
-
-- VAD is CPU-only (WebRTC VAD)
-- Faster-Whisper uses ctranslate2 (doesn't need cuDNN)
-- Verify CUDA version matches: `nvcc --version`
-
-## Performance
-
-**Capacity (RTX 4090):**
-- 10-25 active concurrent speakers
-- p95 interim latency: <250ms
-- p95 finalization latency: <900ms
-
-**Optimization:**
-- Drop final beam_size to 3 for lower latency
-- Reduce tail_seconds under high load
-- Scale horizontally with sticky load balancer
-
-## License
-
-MIT
+This is an MVP: single model instance, single decode worker, but priority ensures finals are processed ahead of interims.
+
+Upgrade path: add distinct interim/final workers and a shared VRAM model pool.
