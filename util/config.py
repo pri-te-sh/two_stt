@@ -15,7 +15,7 @@ class Config(BaseModel):
     
     # Server
     bind_host: str = Field(default="0.0.0.0")
-    bind_port: int = Field(default=8080)
+    bind_port: int = Field(default=8000)
     
     # Models
     interim_model: str = Field(default="small")
@@ -76,8 +76,8 @@ class Config(BaseModel):
         """Load configuration from environment variables."""
         return cls(
             env=os.getenv("ENV", "dev"),
-            bind_host=os.getenv("BIND_HOST", "127.0.0.1"),
-            bind_port=int(os.getenv("BIND_PORT", "8081")),
+            bind_host=os.getenv("BIND_HOST", "0.0.0.0"),
+            bind_port=int(os.getenv("BIND_PORT", "8080")),
             interim_model=os.getenv("INTERIM_MODEL", "small"),
             final_model=os.getenv("FINAL_MODEL", "distil-large-v3"),
             interim_compute=os.getenv("INTERIM_COMPUTE", "int8_float16"),
