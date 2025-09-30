@@ -84,6 +84,7 @@ async def ws_endpoint(ws: WebSocket):
         phase="idle",
         outgoing=asyncio.Queue(maxsize=100),
         created_at=time.time(),
+        rb=rb,  # <—— add this
     )
     assert SCHED and RUNTIME
     RUNTIME.register_connection(conn_id, state)
@@ -173,10 +174,19 @@ async def _handle_control(ws: WebSocket, data: Dict, state: ConnectionState):
             "cooldown_ms": state.interim_cooldown_ms,
         })
     elif t == "stop":
-        # Force finalize current utterance via scheduler by emitting a small
-        # end-of-speech signal from VAD perspective is handled by client; here we
-        # just notify UX.
-        await state.outgoing.put({"type": "status", "stopping": True})
+        try:
+            if state.rb is not None and SCHED is not None:
+                chunk = state.rb.get_since(state.last_commit_sample)
+                if chunk is not None and chunk.size > 0:
+                    SCHED.enqueue_final(state.conn_id, chunk, state.language)
+                    await state.outgoing.put({"type": "status", "forced_final": True})
+                else:
+                    await state.outgoing.put({"type": "status", "forced_final": False, "reason": "no-audio"})
+            else:
+                await state.outgoing.put({"type": "status", "forced_final": False, "reason": "no-rb"})
+        except Exception as e:
+            await state.outgoing.put({"type": "error", "code": "FORCE_FINAL", "detail": str(e)})
+        
     else:
         await state.outgoing.put({"type": "status", "ok": True})
 

@@ -19,6 +19,7 @@ class ConnectionState:
     phase: str  # idle | listening | processing
     outgoing: asyncio.Queue
     created_at: float
+    rb: object | None = None  # PCM16RingBuffer reference for forced flush
 
 
 class GlobalRuntime:
