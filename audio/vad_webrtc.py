@@ -1,54 +1,143 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# File: app/audio/vad_webrtc.py
-# Streaming VAD wrapper using webrtcvad (CPU)
-# ──────────────────────────────────────────────────────────────────────────────
-from __future__ import annotations
+"""WebRTC VAD wrapper for voice activity detection."""
+import numpy as np
 import webrtcvad
+from typing import Optional
+from util.logging import get_logger
+from util.config import config
+
+logger = get_logger(__name__)
 
 
-class StreamingVAD:
-    """Frame-by-frame VAD with simple start/stop detection.
-
-    - Accepts PCM16 mono 16kHz bytes via process_bytes
-    - Uses 20 ms frames
-    - Signals just_started/just_ended flags for consumers
-    """
-
-    def __init__(self, sample_rate: int, aggressiveness: int = 2,
-                 start_trigger_ms: int = 60, end_trigger_ms: int = 500):
-        assert sample_rate == 16000, "WebRTC VAD requires 16kHz mono PCM16"
-        self.v = webrtcvad.Vad(aggressiveness)
+class VADProcessor:
+    """Voice Activity Detection processor using WebRTC VAD."""
+    
+    def __init__(self, sample_rate: int = 16000, mode: int = 2):
+        """
+        Initialize VAD processor.
+        
+        Args:
+            sample_rate: Audio sample rate (8000, 16000, 32000, or 48000)
+            mode: Aggressiveness mode (0-3). Higher = more aggressive filtering
+        """
         self.sample_rate = sample_rate
-        self.frame_bytes = int(0.02 * sample_rate) * 2  # 20ms * 2 bytes
-        self.speaking = False
-        self.speech_ms = 0
-        self.silence_ms = 0
-        self.just_started = False
-        self.just_ended = False
-        self._start_trigger_ms = start_trigger_ms
-        self._end_trigger_ms = end_trigger_ms
-        self._remainder = b""
-
-    def process_bytes(self, raw: bytes):
-        self.just_started = False
-        self.just_ended = False
-        data = self._remainder + raw
-        pos = 0
-        while pos + self.frame_bytes <= len(data):
-            frame = data[pos:pos + self.frame_bytes]
-            pos += self.frame_bytes
-            is_speech = self.v.is_speech(frame, self.sample_rate)
-            if is_speech:
-                self.speech_ms += 20
-                self.silence_ms = 0
-                if not self.speaking and self.speech_ms >= self._start_trigger_ms:
-                    self.speaking = True
-                    self.just_started = True
+        self.mode = mode
+        self.vad = webrtcvad.Vad(mode)
+        
+        # Frame duration for VAD (10, 20, or 30 ms)
+        self.frame_duration_ms = 30
+        self.frame_length = int(sample_rate * self.frame_duration_ms / 1000)
+        
+        logger.info(f"Initialized VAD: mode={mode}, sample_rate={sample_rate}, frame_ms={self.frame_duration_ms}")
+    
+    def is_speech(self, audio: np.ndarray) -> bool:
+        """
+        Check if audio frame contains speech.
+        
+        Args:
+            audio: Audio samples as int16 numpy array
+            
+        Returns:
+            True if speech detected, False otherwise
+        """
+        # Ensure audio is int16
+        if audio.dtype != np.int16:
+            audio = (audio * 32767).astype(np.int16)
+        
+        # VAD requires exact frame length
+        if len(audio) != self.frame_length:
+            # Pad or truncate to frame length
+            if len(audio) < self.frame_length:
+                audio = np.pad(audio, (0, self.frame_length - len(audio)), mode='constant')
             else:
-                self.silence_ms += 20
-                # decay speech counter a bit
-                self.speech_ms = max(0, self.speech_ms - 10)
-                if self.speaking and self.silence_ms >= self._end_trigger_ms:
-                    self.speaking = False
-                    self.just_ended = True
-        self._remainder = data[pos:]
+                audio = audio[:self.frame_length]
+        
+        # Convert to bytes
+        audio_bytes = audio.tobytes()
+        
+        try:
+            return self.vad.is_speech(audio_bytes, self.sample_rate)
+        except Exception as e:
+            logger.warning(f"VAD processing failed: {e}")
+            return False
+    
+    def detect_silence(self, audio: np.ndarray, chunk_size_ms: int = 30) -> bool:
+        """
+        Detect if audio segment is silence by checking multiple frames.
+        
+        Args:
+            audio: Audio samples as numpy array
+            chunk_size_ms: Size of chunks to process
+            
+        Returns:
+            True if segment is silence (no speech detected)
+        """
+        if len(audio) == 0:
+            return True
+        
+        # Ensure int16
+        if audio.dtype != np.int16:
+            audio = (audio * 32767).astype(np.int16)
+        
+        # Process in frames
+        chunk_samples = int(self.sample_rate * chunk_size_ms / 1000)
+        speech_frames = 0
+        total_frames = 0
+        
+        for i in range(0, len(audio), chunk_samples):
+            frame = audio[i:i + chunk_samples]
+            if len(frame) < chunk_samples:
+                # Pad last frame
+                frame = np.pad(frame, (0, chunk_samples - len(frame)), mode='constant')
+            
+            if self.is_speech(frame):
+                speech_frames += 1
+            total_frames += 1
+        
+        # Consider silence if < 20% frames have speech
+        if total_frames == 0:
+            return True
+        
+        speech_ratio = speech_frames / total_frames
+        return speech_ratio < 0.2
+
+
+class SilenceTracker:
+    """Track continuous silence duration for utterance segmentation."""
+    
+    def __init__(self, sample_rate: int = 16000, end_silence_ms: int = 500):
+        """
+        Initialize silence tracker.
+        
+        Args:
+            sample_rate: Audio sample rate
+            end_silence_ms: Silence duration to trigger utterance end
+        """
+        self.sample_rate = sample_rate
+        self.end_silence_samples = int(sample_rate * end_silence_ms / 1000)
+        self.silence_samples = 0
+        self.speech_started = False
+        
+        logger.info(f"Initialized silence tracker: end_silence_ms={end_silence_ms}")
+    
+    def update(self, is_speech: bool, num_samples: int):
+        """
+        Update silence tracker with new audio segment.
+        
+        Args:
+            is_speech: Whether segment contains speech
+            num_samples: Number of audio samples in segment
+        """
+        if is_speech:
+            self.silence_samples = 0
+            self.speech_started = True
+        elif self.speech_started:
+            self.silence_samples += num_samples
+    
+    def should_finalize(self) -> bool:
+        """Check if utterance should be finalized based on silence duration."""
+        return self.speech_started and self.silence_samples >= self.end_silence_samples
+    
+    def reset(self):
+        """Reset silence tracker for new utterance."""
+        self.silence_samples = 0
+        self.speech_started = False

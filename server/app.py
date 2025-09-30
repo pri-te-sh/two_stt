@@ -1,208 +1,152 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# File: app/server/app.py
-# Core FastAPI app with WebSocket, model warmup, scheduler startup
-# ──────────────────────────────────────────────────────────────────────────────
-from __future__ import annotations
-import asyncio
-import json
-import os
-import time
-import uuid
-from typing import Dict, Optional
-
-import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+"""Main FastAPI application."""
+import uvicorn
+from fastapi import FastAPI, WebSocket
 from fastapi.responses import JSONResponse
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from starlette.responses import Response
+from contextlib import asynccontextmanager
 
-from server.routes import router as http_router
-from asr.models import load_models, ModelHandles
-from scheduler.priority import PriorityScheduler
-from runtime.state import ConnectionState, GlobalRuntime
-from audio.vad_webrtc import StreamingVAD
-from audio.buffer import PCM16RingBuffer
+from server.routes import websocket_endpoint
+from runtime.state import get_runtime
+from util.logging import setup_logging, get_logger
+from util.config import config
+import metrics.prometheus as metrics
 
-app = FastAPI(title="Hybrid Realtime STT Service", version="0.1.0")
-app.include_router(http_router)
-
-MODELS: Optional[ModelHandles] = None
-SCHED: Optional[PriorityScheduler] = None
-RUNTIME: Optional[GlobalRuntime] = None
-
-# Defaults (tweak via env or .env in prod)
-INTERIM_COOLDOWN_MS = int(os.getenv("INTERIM_COOLDOWN_MS", "220"))
-TAIL_SECONDS_NORMAL = float(os.getenv("TAIL_SECONDS", "7"))
-TAIL_SECONDS_HIGH = 3.0
-TAIL_SECONDS_CRIT = 2.0
-SAMPLE_RATE = 16000
-MAX_BUFFER_SECONDS = 30
+# Setup logging first
+setup_logging()
+logger = get_logger(__name__)
 
 
-@app.on_event("startup")
-async def _startup():
-    global MODELS, SCHED, RUNTIME
-    # Load models once (shared in-process)
-    MODELS = load_models()
-    # Init global runtime (metrics, registries)
-    RUNTIME = GlobalRuntime(sample_rate=SAMPLE_RATE)
-    # Start scheduler
-    SCHED = PriorityScheduler(models=MODELS, runtime=RUNTIME)
-    await SCHED.start()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager for startup and shutdown."""
+    # Startup
+    logger.info("Starting STT server...")
+    logger.info(f"Environment: {config.env}")
+    logger.info(f"Bind: {config.bind_host}:{config.bind_port}")
+    logger.info(f"Models: interim={config.interim_model}, final={config.final_model}")
+    
+    # Initialize runtime
+    runtime = get_runtime()
+    await runtime.startup()
+    
+    logger.info("STT server started successfully")
+    
+    # Set system info metrics
+    metrics.system_info.info({
+        "interim_model": config.interim_model,
+        "final_model": config.final_model,
+        "sample_rate": str(config.sample_rate),
+    })
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down STT server...")
+    await runtime.shutdown()
+    logger.info("STT server shut down")
 
 
-@app.on_event("shutdown")
-async def _shutdown():
-    if SCHED:
-        await SCHED.stop()
+# Create FastAPI app
+app = FastAPI(
+    title="Real-time STT Server",
+    description="Dual-model speech-to-text server with interim and final transcriptions",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 
 @app.get("/health")
 async def health():
-    return JSONResponse({"status": "ok"})
+    """Basic health check (process is alive)."""
+    return {"status": "ok"}
 
 
 @app.get("/ready")
 async def ready():
-    ok = (MODELS is not None) and (SCHED is not None and SCHED.running)
-    return JSONResponse({"ready": ok})
+    """Readiness check (models loaded and workers running)."""
+    runtime = get_runtime()
+    
+    is_ready = (
+        runtime.models is not None and
+        runtime.worker_final is not None and
+        runtime.worker_interim is not None and
+        runtime.worker_final.running and
+        runtime.worker_interim.running
+    )
+    
+    if is_ready:
+        return {"status": "ready"}
+    else:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready"}
+        )
+
+
+@app.get("/status")
+async def status():
+    """Detailed status including queue depths and configuration."""
+    runtime = get_runtime()
+    
+    queue_depths = runtime.scheduler.get_queue_depths()
+    scheduler_stats = runtime.scheduler.get_stats()
+    bp_state = runtime.backpressure.get_state()
+    
+    worker_stats = {}
+    if runtime.worker_final:
+        worker_stats["final"] = runtime.worker_final.get_stats()
+    if runtime.worker_interim:
+        worker_stats["interim"] = runtime.worker_interim.get_stats()
+    
+    return {
+        "status": "running",
+        "config": {
+            "interim_model": config.interim_model,
+            "final_model": config.final_model,
+            "sample_rate": config.sample_rate,
+            "base_cooldown_ms": config.interim_cooldown_ms,
+            "base_tail_seconds": config.tail_seconds,
+        },
+        "queues": queue_depths,
+        "scheduler_stats": scheduler_stats,
+        "backpressure": bp_state,
+        "workers": worker_stats,
+        "connections": {
+            "active": len(runtime.connections),
+        }
+    }
+
+
+@app.get("/metrics")
+async def metrics_endpoint():
+    """Prometheus metrics endpoint."""
+    if not config.enable_metrics:
+        return Response(status_code=404)
+    
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST
+    )
 
 
 @app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
-    await ws.accept()
-    conn_id = str(uuid.uuid4())
+async def websocket_route(websocket: WebSocket):
+    """WebSocket endpoint for audio streaming."""
+    await websocket_endpoint(websocket)
 
-    # Per-connection state
-    rb = PCM16RingBuffer(sample_rate=SAMPLE_RATE, max_seconds=MAX_BUFFER_SECONDS)
-    vad = StreamingVAD(sample_rate=SAMPLE_RATE)
-    state = ConnectionState(
-        conn_id=conn_id,
-        language=os.getenv("ASR_LANGUAGE", "auto"),
-        interim_cooldown_ms=INTERIM_COOLDOWN_MS,
-        last_emit_ts_ms=0,
-        last_interim_text="",
-        last_commit_sample=0,
-        phase="idle",
-        outgoing=asyncio.Queue(maxsize=100),
-        created_at=time.time(),
-        rb=rb,  # <—— add this
+
+def main():
+    """Main entry point."""
+    uvicorn.run(
+        "server.app:app",
+        host=config.bind_host,
+        port=config.bind_port,
+        loop="uvloop",
+        log_config=None,  # We handle logging ourselves
+        access_log=False
     )
-    assert SCHED and RUNTIME
-    RUNTIME.register_connection(conn_id, state)
-
-    # Start a sender task to serialize server → client messages
-    sender_task = asyncio.create_task(_sender_loop(ws, state))
-
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg.get("type") == "websocket.disconnect":
-                raise WebSocketDisconnect
-
-            if "text" in msg and msg["text"] is not None:
-                # Control JSON
-                try:
-                    data = json.loads(msg["text"]) if msg["text"] else {}
-                except Exception:
-                    continue
-                await _handle_control(ws, data, state)
-                continue
-
-            if "bytes" in msg and msg["bytes"]:
-                raw = msg["bytes"]
-                # Append to ring buffer and run VAD frames
-                appended_samples = rb.append_bytes(raw)
-                vad.process_bytes(raw)
-
-                # State machine: detect transitions
-                now_ms = int(time.time() * 1000)
-                if vad.just_started and state.phase != "listening":
-                    state.phase = "listening"
-
-                # Opportunistic interims (respect cooldown & backpressure)
-                tail_sec = SCHED.dynamic_tail_seconds()
-                if state.phase == "listening" and _cooldown_ok(state, now_ms, SCHED):
-                    tail_audio = rb.tail_seconds(tail_sec)
-                    if tail_audio is not None and tail_audio.size > 0:
-                        SCHED.enqueue_interim(conn_id, tail_audio, state.language)
-                        state.last_emit_ts_ms = now_ms
-
-                # Finalization when end-of-utterance detected
-                if vad.just_ended:
-                    # Slice utterance from last_commit_sample to current end
-                    end_sample = rb.current_sample_index
-                    chunk = rb.get_since(state.last_commit_sample)
-                    if chunk is not None and chunk.size > 0:
-                        SCHED.enqueue_final(conn_id, chunk, state.language)
-                        state.phase = "processing"
-                        state.last_commit_sample = end_sample
-            # else: unknown frame, ignore
-
-    except WebSocketDisconnect:
-        pass
-    finally:
-        # Cleanup
-        if sender_task:
-            sender_task.cancel()
-            try:
-                await sender_task
-            except Exception:
-                pass
-        RUNTIME.unregister_connection(conn_id)
 
 
-async def _handle_control(ws: WebSocket, data: Dict, state: ConnectionState):
-    t = data.get("event")
-    if t == "start":
-        lang = data.get("language")
-        if lang:
-            state.language = lang
-        await state.outgoing.put({"type": "status", "ok": True, "language": state.language})
-    elif t == "set":
-        if "language" in data:
-            state.language = data["language"]
-        if "interimRate" in data:
-            try:
-                # rate per second → cooldown ms
-                r = float(data["interimRate"]) or 1.0
-                state.interim_cooldown_ms = max(50, int(1000.0 / r))
-            except Exception:
-                pass
-        await state.outgoing.put({
-            "type": "status",
-            "ok": True,
-            "language": state.language,
-            "cooldown_ms": state.interim_cooldown_ms,
-        })
-    elif t == "stop":
-        try:
-            if state.rb is not None and SCHED is not None:
-                chunk = state.rb.get_since(state.last_commit_sample)
-                if chunk is not None and chunk.size > 0:
-                    SCHED.enqueue_final(state.conn_id, chunk, state.language)
-                    await state.outgoing.put({"type": "status", "forced_final": True})
-                else:
-                    await state.outgoing.put({"type": "status", "forced_final": False, "reason": "no-audio"})
-            else:
-                await state.outgoing.put({"type": "status", "forced_final": False, "reason": "no-rb"})
-        except Exception as e:
-            await state.outgoing.put({"type": "error", "code": "FORCE_FINAL", "detail": str(e)})
-        
-    else:
-        await state.outgoing.put({"type": "status", "ok": True})
-
-
-def _cooldown_ok(state: ConnectionState, now_ms: int, sched: PriorityScheduler) -> bool:
-    # Scheduler can globally increase cooldown under pressure
-    cd = max(state.interim_cooldown_ms, sched.global_interim_cooldown_ms())
-    return (now_ms - state.last_emit_ts_ms) >= cd
-
-
-async def _sender_loop(ws: WebSocket, state: ConnectionState):
-    """Serialize server → client sends from multiple producers (decode workers)."""
-    try:
-        while True:
-            msg = await state.outgoing.get()
-            await ws.send_text(json.dumps(msg))
-    except Exception:
-        pass
-
+if __name__ == "__main__":
+    main()

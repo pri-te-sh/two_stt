@@ -1,168 +1,194 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# File: app/scheduler/priority.py
-# Priority scheduler, coalescing interim queue, decode workers
-# ──────────────────────────────────────────────────────────────────────────────
-from __future__ import annotations
+"""Priority scheduler for decode jobs with coalescing and fairness."""
 import asyncio
 import time
-from dataclasses import dataclass
-from typing import Dict, Optional
-import numpy as np
+from typing import Dict, Optional, List
+from collections import deque
+from server.schemas import DecodeJob, JobType
+from util.logging import get_logger
+from util.config import config
 
-from asr.models import ModelHandles
-from asr.decode import decode_interim, decode_final
-from runtime.state import GlobalRuntime
-
-
-@dataclass
-class Job:
-    kind: str  # 'final' or 'interim'
-    conn_id: str
-    audio: np.ndarray
-    language: str
-    ts: float
-
-
-class CoalescingInterimQueue:
-    def __init__(self):
-        self._by_conn: Dict[str, Job] = {}
-
-    def put(self, job: Job):
-        # Replace existing job for the same connection
-        self._by_conn[job.conn_id] = job
-
-    def pop_oldest(self) -> Optional[Job]:
-        if not self._by_conn:
-            return None
-        # pick oldest by ts
-        cid, job = min(self._by_conn.items(), key=lambda kv: kv[1].ts)
-        del self._by_conn[cid]
-        return job
-
-    def __len__(self):
-        return len(self._by_conn)
+logger = get_logger(__name__)
 
 
 class PriorityScheduler:
-    def __init__(self, models: ModelHandles, runtime: GlobalRuntime):
-        self.models = models
-        self.runtime = runtime
-        self.q_final: asyncio.Queue[Job] = asyncio.Queue()
-        self.q_interim = CoalescingInterimQueue()
-        self._task = None
-        self.running = False
-        self._tick_ms = 12
-        self._final_burst = 2
-        self._interim_burst = 3
-        # dynamic backpressure knobs
-        self._global_interim_cooldown_ms = 0
-        self._stop_evt = asyncio.Event()
-        # per-model locks to avoid concurrent decode on same handle
-        self._lock_final = asyncio.Lock()
-        self._lock_interim = asyncio.Lock()
-
-    async def start(self):
-        self.running = True
-        self._stop_evt.clear()
-        self._task = asyncio.create_task(self._run())
-
-    async def stop(self):
-        self.running = False
-        self._stop_evt.set()
-        if self._task:
-            await self._task
-
-    def enqueue_final(self, conn_id: str, audio: np.ndarray, language: str):
-        self.q_final.put_nowait(Job("final", conn_id, audio, language, time.time()))
-
-    def enqueue_interim(self, conn_id: str, audio: np.ndarray, language: str):
-        self.q_interim.put(Job("interim", conn_id, audio, language, time.time()))
-
-    def dynamic_tail_seconds(self) -> float:
-        # Shrink tail as interim backlog grows
-        q = len(self.q_interim)
-        if q >= 40:
-            return 2.0
-        if q >= 20:
-            return 3.5
-        return 7.0
-
-    def global_interim_cooldown_ms(self) -> int:
-        # Increase cooldown as interim backlog grows
-        q = len(self.q_interim)
-        if q >= 40:
-            return 1000
-        if q >= 20:
-            return 350
-        return 0
-
-    async def _run(self):
-        try:
-            while not self._stop_evt.is_set():
-                # Finals first
-                f_served = 0
-                while f_served < self._final_burst and not self.q_final.empty():
-                    job = await self.q_final.get()
-                    await self._serve_final(job)
-                    f_served += 1
-
-                # Interims (skip if finals backlog is high)
-                i_served = 0
-                if self.q_final.qsize() == 0:
-                    while i_served < self._interim_burst and len(self.q_interim) > 0:
-                        job = self.q_interim.pop_oldest()
-                        if job:
-                            await self._serve_interim(job)
-                            i_served += 1
-
-                await asyncio.sleep(self._tick_ms / 1000.0)
-        except Exception as e:
-            # In production, log this
-            self.running = False
-
-    async def _serve_interim(self, job: Job):
-        state = self.runtime.connection(job.conn_id)
-        if state is None:
-            return
-        async with self._lock_interim:
-            text = decode_interim(self.models.interim, job.audio, job.language)
-        # Stabilization: only send if changed meaningfully
-        if _should_emit_interim(prev=state.last_interim_text, new=text, now=time.time(), last_sent_ms=state.last_emit_ts_ms):
-            state.last_interim_text = text
-            await state.outgoing.put({
-                "type": "interim",
-                "conn": job.conn_id,
-                "text": text,
-                "t0": None,
-                "t1": None,
-            })
-
-    async def _serve_final(self, job: Job):
-        state = self.runtime.connection(job.conn_id)
-        if state is None:
-            return
-        async with self._lock_final:
-            result = decode_final(self.models.final, job.audio, job.language)
-        # Reset interim state for next utterance
-        state.last_interim_text = ""
-        state.phase = "idle"
-        await state.outgoing.put({
-            "type": "final",
-            "conn": job.conn_id,
-            **result,
-        })
-
-
-def _should_emit_interim(prev: str, new: str, now: float, last_sent_ms: int) -> bool:
-    if not new:
-        return False
-    if not prev:
+    """
+    Priority scheduler with deadline-aware fairness and interim coalescing.
+    
+    Features:
+    - Finals always have priority over interims
+    - Within each queue type, older jobs are prioritized (FIFO with age)
+    - Interim coalescing: max 1 queued interim per connection
+    - Burst limits can throttle interims when finals are backed up
+    """
+    
+    def __init__(self):
+        """Initialize scheduler."""
+        self.q_final: deque[DecodeJob] = deque()
+        self.q_interim: deque[DecodeJob] = deque()
+        
+        # Track queued interims per connection for coalescing
+        self.interim_queued_by_conn: Dict[str, DecodeJob] = {}
+        
+        # Track in-flight jobs per connection
+        self.inflight_by_conn: Dict[str, DecodeJob] = {}
+        
+        # Burst limits (can be dynamically adjusted)
+        self.f_final_burst = config.f_final_burst
+        self.f_interim_burst = config.f_interim_burst
+        
+        # Stats
+        self.stats = {
+            "total_enqueued_finals": 0,
+            "total_enqueued_interims": 0,
+            "total_dequeued_finals": 0,
+            "total_dequeued_interims": 0,
+            "total_coalesced": 0,
+        }
+        
+        logger.info(f"Initialized scheduler: f_final_burst={self.f_final_burst}, f_interim_burst={self.f_interim_burst}")
+    
+    def enqueue_final(self, job: DecodeJob):
+        """
+        Enqueue a final transcription job.
+        
+        Args:
+            job: DecodeJob for final transcription
+        """
+        self.q_final.append(job)
+        self.stats["total_enqueued_finals"] += 1
+        logger.debug(f"Enqueued final job {job.job_id} for {job.conn_id}, queue_len={len(self.q_final)}")
+    
+    def enqueue_interim(self, job: DecodeJob) -> bool:
+        """
+        Enqueue an interim transcription job with coalescing.
+        
+        If this connection already has an interim queued, replace it (coalesce).
+        If this connection has an interim in-flight, reject the job.
+        
+        Args:
+            job: DecodeJob for interim transcription
+            
+        Returns:
+            True if enqueued, False if rejected (in-flight)
+        """
+        conn_id = job.conn_id
+        
+        # Check if connection has interim in-flight
+        if conn_id in self.inflight_by_conn:
+            inflight_job = self.inflight_by_conn[conn_id]
+            if inflight_job.job_type == JobType.INTERIM:
+                logger.debug(f"Rejected interim for {conn_id}: already in-flight")
+                return False
+        
+        # Check if connection already has interim queued
+        if conn_id in self.interim_queued_by_conn:
+            # Coalesce: replace old interim with new one
+            old_job = self.interim_queued_by_conn[conn_id]
+            try:
+                self.q_interim.remove(old_job)
+                self.stats["total_coalesced"] += 1
+                logger.debug(f"Coalesced interim for {conn_id}: replaced {old_job.job_id} with {job.job_id}")
+            except ValueError:
+                # Old job was already dequeued, proceed normally
+                pass
+        
+        # Enqueue new interim
+        self.q_interim.append(job)
+        self.interim_queued_by_conn[conn_id] = job
+        self.stats["total_enqueued_interims"] += 1
+        logger.debug(f"Enqueued interim job {job.job_id} for {conn_id}, queue_len={len(self.q_interim)}")
         return True
-    if new == prev:
-        return False
-    # simple growth or edit distance proxy
-    if abs(len(new) - len(prev)) >= 6:
-        return True
-    # time-based throttle backup (>= 0.35s)
-    return (now * 1000 - last_sent_ms) >= 350
-
+    
+    def get_next_job(self) -> Optional[DecodeJob]:
+        """
+        Get next job to process based on priority and burst limits.
+        
+        Priority order:
+        1. Finals (up to f_final_burst)
+        2. Interims (up to f_interim_burst)
+        
+        Returns:
+            Next job to process, or None if no jobs available
+        """
+        current_time = time.time()
+        
+        # Try to get a final job first (if not exceeding burst)
+        if len(self.q_final) > 0 and self.f_final_burst > 0:
+            job = self.q_final.popleft()
+            self.stats["total_dequeued_finals"] += 1
+            self.inflight_by_conn[job.conn_id] = job
+            
+            job_age = current_time - job.created_at
+            logger.debug(f"Dequeued final job {job.job_id}, age={job_age:.3f}s, remaining={len(self.q_final)}")
+            return job
+        
+        # Try to get an interim job (if not exceeding burst and allowed)
+        if len(self.q_interim) > 0 and self.f_interim_burst > 0:
+            job = self.q_interim.popleft()
+            self.stats["total_dequeued_interims"] += 1
+            self.inflight_by_conn[job.conn_id] = job
+            
+            # Remove from queued tracking
+            if job.conn_id in self.interim_queued_by_conn:
+                del self.interim_queued_by_conn[job.conn_id]
+            
+            job_age = current_time - job.created_at
+            logger.debug(f"Dequeued interim job {job.job_id}, age={job_age:.3f}s, remaining={len(self.q_interim)}")
+            return job
+        
+        return None
+    
+    def mark_job_complete(self, job: DecodeJob):
+        """
+        Mark a job as complete and remove from in-flight tracking.
+        
+        Args:
+            job: Completed job
+        """
+        if job.conn_id in self.inflight_by_conn:
+            del self.inflight_by_conn[job.conn_id]
+            logger.debug(f"Marked job {job.job_id} complete for {job.conn_id}")
+    
+    def set_burst_limits(self, f_final_burst: int, f_interim_burst: int):
+        """
+        Update burst limits dynamically for backpressure management.
+        
+        Args:
+            f_final_burst: Max finals to process per scheduler cycle
+            f_interim_burst: Max interims to process per scheduler cycle (0 = paused)
+        """
+        self.f_final_burst = f_final_burst
+        self.f_interim_burst = f_interim_burst
+        logger.info(f"Updated burst limits: final={f_final_burst}, interim={f_interim_burst}")
+    
+    def get_queue_depths(self) -> Dict[str, int]:
+        """Get current queue depths."""
+        return {
+            "q_final": len(self.q_final),
+            "q_interim": len(self.q_interim),
+        }
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get scheduler statistics."""
+        return self.stats.copy()
+    
+    def get_oldest_job_age(self, job_type: JobType) -> Optional[float]:
+        """
+        Get age of oldest job in queue.
+        
+        Args:
+            job_type: Type of job to check
+            
+        Returns:
+            Age in seconds, or None if queue is empty
+        """
+        current_time = time.time()
+        
+        if job_type == JobType.FINAL and len(self.q_final) > 0:
+            oldest_job = self.q_final[0]
+            return current_time - oldest_job.created_at
+        elif job_type == JobType.INTERIM and len(self.q_interim) > 0:
+            oldest_job = self.q_interim[0]
+            return current_time - oldest_job.created_at
+        
+        return None
